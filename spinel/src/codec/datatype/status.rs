@@ -273,6 +273,22 @@ impl TryFrom<u32> for ResetReason {
     }
 }
 
+impl From<ResetReason> for u32 {
+    fn from(reason: ResetReason) -> u32 {
+        match reason {
+            ResetReason::PowerOn => ResetReason::RESET_POWER_ON,
+            ResetReason::External => ResetReason::RESET_EXTERNAL,
+            ResetReason::Software => ResetReason::RESET_SOFTWARE,
+            ResetReason::Fault => ResetReason::RESET_FAULT,
+            ResetReason::Crash => ResetReason::RESET_CRASH,
+            ResetReason::Assert => ResetReason::RESET_ASSERT,
+            ResetReason::Other => ResetReason::RESET_OTHER,
+            ResetReason::Unknown => ResetReason::RESET_UNKNOWN,
+            ResetReason::Watchdog => ResetReason::RESET_WATCHDOG,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,5 +338,13 @@ mod tests {
 
         assert_eq!(ResetReason::try_from(111), Err(()));
         assert_eq!(ResetReason::try_from(121), Err(()));
+    }
+
+    #[test]
+    fn reset_reason_round_trips() {
+        for code in 112u32..=120 {
+            let reason = ResetReason::try_from(code).unwrap();
+            assert_eq!(u32::from(reason), code);
+        }
     }
 }

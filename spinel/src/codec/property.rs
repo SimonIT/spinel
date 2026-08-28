@@ -11,7 +11,7 @@ const PROP_CAPS: u32 = 0x05;
 const PROP_HWADDR: u32 = 0x08;
 const PROP_PHY_ENABLED: u32 = 0x20;
 const PROP_PHY_CHAN: u32 = 0x21;
-const PROP_PHY_TX_POWER: u32 = 0x26;
+const PROP_PHY_TX_POWER: u32 = 0x25;
 const PROP_MAC_RAW_STREAM_ENABLED: u32 = 0x37;
 const PROP_MAC_PROMISCUOUS_MODE: u32 = 0x38;
 const PROP_STREAM_DEBUG: u32 = 0x70;
@@ -250,7 +250,7 @@ mod tests {
             (Property::HardwareAddress, 0x08),
             (Property::PhysicalEnabled, 0x20),
             (Property::PhysicalChannel, 0x21),
-            (Property::PhysicalTxPower, 0x26),
+            (Property::PhysicalTxPower, 0x25),
             (Property::MacRawStreamEnabled, 0x37),
             (Property::MacPromiscuousMode, 0x38),
             (Property::Stream(PropertyStream::Debug), 0x70),
