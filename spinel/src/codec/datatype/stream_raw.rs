@@ -131,6 +131,56 @@ impl RawTxFrame {
 
         Ok(num)
     }
+
+    /// Decode a raw stream property value written by a host.
+    ///
+    /// This is the device-side inverse of [`Self::encode`]. The FCS
+    /// placeholder is stripped from the PSDU. The channel is required, and
+    /// every later transmit parameter is optional and takes its
+    /// [`RawTxConfig::default`] value when absent, matching OpenThread's RCP.
+    /// The CSL delay fields and any trailing parameters are skipped.
+    pub fn decode(buffer: &Bytes) -> Result<Self, Error> {
+        let (range, consumed) = SpinelData::decode(buffer)?;
+        if range.len() < FCS_LEN || range.len() > MAX_PSDU_LEN + FCS_LEN {
+            return Err(Error::PsduLength(range.len()));
+        }
+        let psdu = buffer.slice(range.start..range.end - FCS_LEN);
+        let mut rest = &buffer[consumed..];
+
+        let (channel, len) = SpinelU8::decode(rest)?;
+        rest = &rest[len..];
+
+        let defaults = RawTxConfig::default();
+        let max_csma_backoffs =
+            next_field(&mut rest, SpinelU8::decode).unwrap_or(defaults.max_csma_backoffs);
+        let max_frame_retries =
+            next_field(&mut rest, SpinelU8::decode).unwrap_or(defaults.max_frame_retries);
+        let csma_ca_enabled =
+            next_field(&mut rest, SpinelBool::decode).unwrap_or(defaults.csma_ca_enabled);
+        let is_header_updated =
+            next_field(&mut rest, SpinelBool::decode).unwrap_or(defaults.is_header_updated);
+        let is_a_retx = next_field(&mut rest, SpinelBool::decode).unwrap_or(defaults.is_a_retx);
+        let security_processed =
+            next_field(&mut rest, SpinelBool::decode).unwrap_or(defaults.security_processed);
+        let _tx_delay = next_field(&mut rest, SpinelU32::decode);
+        let _tx_delay_base_time = next_field(&mut rest, SpinelU32::decode);
+        let rx_channel_after_tx_done =
+            next_field(&mut rest, SpinelU8::decode).filter(|&rx| rx != channel);
+
+        Ok(Self {
+            psdu,
+            channel,
+            config: RawTxConfig {
+                max_csma_backoffs,
+                max_frame_retries,
+                csma_ca_enabled,
+                is_header_updated,
+                is_a_retx,
+                security_processed,
+                rx_channel_after_tx_done,
+            },
+        })
+    }
 }
 
 // A manual impl, because `Bytes` does not implement `defmt::Format`. The
@@ -182,6 +232,56 @@ pub struct RawRxFrame {
 }
 
 impl RawRxFrame {
+    /// A received PSDU with every metadata field at its default.
+    pub fn new(psdu: Bytes) -> Self {
+        Self {
+            psdu,
+            rssi: DEFAULT_RSSI,
+            noise_floor: DEFAULT_NOISE_FLOOR,
+            flags: 0,
+            channel: None,
+            lqi: None,
+            timestamp_us: None,
+        }
+    }
+
+    /// Encode the frame as a raw stream property value, as a device sends it.
+    ///
+    /// This is the device-side inverse of [`Self::decode`]. OpenThread's host
+    /// requires the PHY-data, vendor-data, and MAC-data structures to be
+    /// present, so all three are always written. Absent PHY fields encode as
+    /// zero, the receive error as none, and the ACK security fields as zero.
+    ///
+    /// Returns the number of bytes that were written. Errors when the PSDU is
+    /// longer than an 802.15.4 frame allows.
+    pub fn encode(&self, buffer: &mut BytesMut) -> Result<usize, Error> {
+        if self.psdu.len() > MAX_PSDU_LEN + FCS_LEN {
+            return Err(Error::PsduLength(self.psdu.len()));
+        }
+
+        let mut num = SpinelData::write_to_buffer(&self.psdu, buffer);
+        num += SpinelI8::write_to_buffer(self.rssi, buffer);
+        num += SpinelI8::write_to_buffer(self.noise_floor, buffer);
+        num += SpinelU16::write_to_buffer(self.flags, buffer);
+
+        let mut phy = BytesMut::new();
+        SpinelU8::write_to_buffer(self.channel.unwrap_or(0), &mut phy);
+        SpinelU8::write_to_buffer(self.lqi.unwrap_or(0), &mut phy);
+        SpinelU64::write_to_buffer(self.timestamp_us.unwrap_or(0), &mut phy);
+        num += SpinelData::write_to_buffer(&phy, buffer);
+
+        let mut vendor = BytesMut::new();
+        PackedU32::write_to_buffer(0, &mut vendor);
+        num += SpinelData::write_to_buffer(&vendor, buffer);
+
+        let mut mac = BytesMut::new();
+        SpinelU8::write_to_buffer(0, &mut mac);
+        SpinelU32::write_to_buffer(0, &mut mac);
+        num += SpinelData::write_to_buffer(&mac, buffer);
+
+        Ok(num)
+    }
+
     /// Decode a received raw stream property value.
     ///
     /// Metadata fields that are absent take their documented defaults. The
@@ -191,10 +291,9 @@ impl RawRxFrame {
         let psdu = buffer.slice(range);
         let mut rest = &buffer[consumed..];
 
-        let rssi = Self::next_field(&mut rest, SpinelI8::decode).unwrap_or(DEFAULT_RSSI);
-        let noise_floor =
-            Self::next_field(&mut rest, SpinelI8::decode).unwrap_or(DEFAULT_NOISE_FLOOR);
-        let flags = Self::next_field(&mut rest, SpinelU16::decode).unwrap_or(0);
+        let rssi = next_field(&mut rest, SpinelI8::decode).unwrap_or(DEFAULT_RSSI);
+        let noise_floor = next_field(&mut rest, SpinelI8::decode).unwrap_or(DEFAULT_NOISE_FLOOR);
+        let flags = next_field(&mut rest, SpinelU16::decode).unwrap_or(0);
 
         let mut channel = None;
         let mut lqi = None;
@@ -202,9 +301,9 @@ impl RawRxFrame {
 
         if let Ok((phy_range, _)) = SpinelData::decode(rest) {
             let mut phy = &rest[phy_range];
-            channel = Self::next_field(&mut phy, SpinelU8::decode);
-            lqi = Self::next_field(&mut phy, SpinelU8::decode);
-            timestamp_us = Self::next_field(&mut phy, SpinelU64::decode);
+            channel = next_field(&mut phy, SpinelU8::decode);
+            lqi = next_field(&mut phy, SpinelU8::decode);
+            timestamp_us = next_field(&mut phy, SpinelU64::decode);
         }
 
         Ok(Self {
@@ -216,23 +315,6 @@ impl RawRxFrame {
             lqi,
             timestamp_us,
         })
-    }
-
-    /// Decode one optional metadata field and advance the cursor.
-    ///
-    /// Returns `None` when the field is absent or truncated, so a partially
-    /// specified metadata block decodes to defaults instead of an error.
-    fn next_field<T>(
-        rest: &mut &[u8],
-        decode: impl Fn(&[u8]) -> Result<(T, usize), Error>,
-    ) -> Option<T> {
-        match decode(rest) {
-            Ok((value, consumed)) => {
-                *rest = &rest[consumed..];
-                Some(value)
-            }
-            Err(_) => None,
-        }
     }
 }
 
@@ -325,6 +407,23 @@ impl<V: Vendor> RawTxDone<V> {
             header_updated,
             ack,
         })
+    }
+}
+
+/// Decode one optional field and advance the cursor.
+///
+/// Returns `None` when the field is absent or truncated, so a partially
+/// specified metadata block decodes to defaults instead of an error.
+fn next_field<T>(
+    rest: &mut &[u8],
+    decode: impl Fn(&[u8]) -> Result<(T, usize), Error>,
+) -> Option<T> {
+    match decode(rest) {
+        Ok((value, consumed)) => {
+            *rest = &rest[consumed..];
+            Some(value)
+        }
+        Err(_) => None,
     }
 }
 
@@ -537,5 +636,105 @@ mod tests {
         assert_eq!(done.status, Status::NoAck);
         assert!(done.header_updated);
         assert_eq!(done.ack, None);
+    }
+
+    #[test]
+    fn tx_decode_inverts_encode() {
+        let frames = [
+            RawTxFrame {
+                psdu: Bytes::from_static(&[0x01, 0x02]),
+                channel: 11,
+                config: RawTxConfig::default(),
+            },
+            RawTxFrame {
+                psdu: Bytes::from_static(&[0xAA; MAX_PSDU_LEN]),
+                channel: 26,
+                config: RawTxConfig {
+                    max_csma_backoffs: 2,
+                    max_frame_retries: 3,
+                    csma_ca_enabled: false,
+                    is_header_updated: true,
+                    is_a_retx: true,
+                    security_processed: true,
+                    rx_channel_after_tx_done: Some(15),
+                },
+            },
+        ];
+
+        for frame in frames {
+            let mut buffer = BytesMut::new();
+            frame.encode(&mut buffer).unwrap();
+            assert_eq!(RawTxFrame::decode(&buffer.freeze()), Ok(frame));
+        }
+    }
+
+    #[test]
+    fn tx_decode_defaults_absent_optional_parameters() {
+        // PSDU length 4 (2 bytes + FCS placeholder), then only the channel.
+        let wire = Bytes::from_static(&[0x04, 0x00, 0x01, 0x02, 0x00, 0x00, 0x0B]);
+        let frame = RawTxFrame::decode(&wire).unwrap();
+
+        assert_eq!(frame.psdu, Bytes::from_static(&[0x01, 0x02]));
+        assert_eq!(frame.channel, 11);
+        assert_eq!(frame.config, RawTxConfig::default());
+    }
+
+    #[test]
+    fn tx_decode_requires_channel_and_fcs() {
+        let no_channel = Bytes::from_static(&[0x02, 0x00, 0x00, 0x00]);
+        assert!(RawTxFrame::decode(&no_channel).is_err());
+
+        let no_fcs = Bytes::from_static(&[0x01, 0x00, 0xAA, 0x0B]);
+        assert_eq!(RawTxFrame::decode(&no_fcs), Err(Error::PsduLength(1)));
+    }
+
+    #[test]
+    fn rx_encode_pins_wire_layout() {
+        let frame = RawRxFrame {
+            psdu: Bytes::from_static(&[0xAB, 0xCD]),
+            rssi: -40,
+            noise_floor: -100,
+            flags: RAW_FRAME_FLAG_DUPE,
+            channel: Some(15),
+            lqi: Some(200),
+            timestamp_us: Some(0x0102),
+        };
+        let mut buffer = BytesMut::new();
+        let num = frame.encode(&mut buffer).unwrap();
+
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x02, 0x00, 0xAB, 0xCD,         // PSDU
+            0xD8, 0x9C,                     // RSSI, noise floor
+            0x08, 0x00,                     // flags
+            0x0A, 0x00, 0x0F, 0xC8,         // PHY-data: channel, LQI
+            0x02, 0x01, 0, 0, 0, 0, 0, 0,   //   timestamp
+            0x01, 0x00, 0x00,               // vendor-data: receive error
+            0x05, 0x00, 0x00, 0, 0, 0, 0,   // MAC-data: ack key ID, frame counter
+        ];
+        assert_eq!(&buffer[..], expected);
+        assert_eq!(num, expected.len());
+        assert_eq!(RawRxFrame::decode(&buffer.freeze()), Ok(frame));
+    }
+
+    #[test]
+    fn rx_new_uses_metadata_defaults() {
+        let frame = RawRxFrame::new(Bytes::from_static(&[0x01]));
+        assert_eq!(frame.rssi, DEFAULT_RSSI);
+        assert_eq!(frame.noise_floor, DEFAULT_NOISE_FLOOR);
+        assert_eq!(frame.flags, 0);
+        assert_eq!(
+            (frame.channel, frame.lqi, frame.timestamp_us),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn rx_encode_rejects_oversized_psdu() {
+        let frame = RawRxFrame::new(Bytes::from_static(&[0u8; 128]));
+        assert_eq!(
+            frame.encode(&mut BytesMut::new()),
+            Err(Error::PsduLength(128))
+        );
     }
 }

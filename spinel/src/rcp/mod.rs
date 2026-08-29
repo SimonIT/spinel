@@ -11,8 +11,11 @@
 //! access is dispatched through the [`Radio`] trait, which callers implement against
 //! whatever hardware they target.
 
-use crate::{Command, Frame, Header, PackedU32, Property, PropertyStream, ResetReason, Status};
-use bytes::Bytes;
+use crate::{
+    Command, Frame, Header, PackedU32, Property, PropertyStream, RawRxFrame, RawTxFrame,
+    ResetReason, Status,
+};
+use bytes::{Bytes, BytesMut};
 
 /// Hardware/radio operations [`RcpDevice`] dispatches PHY/MAC property access to.
 ///
@@ -45,7 +48,11 @@ pub trait Radio {
     /// The radio's static EUI-64 hardware address.
     fn hardware_address(&self) -> [u8; 8];
 
-    /// Queue a raw frame (e.g. an 802.15.4 PSDU) for transmission.
+    /// Queue a raw 802.15.4 frame for transmission.
+    ///
+    /// `frame` is the PSDU without the 2-byte FCS: the host sends an FCS
+    /// placeholder, which [`RawTxFrame::decode`] strips, and the radio computes
+    /// the real FCS.
     fn transmit(&mut self, frame: &[u8]) -> Result<(), Status>;
 
     /// Non-blocking poll for a received raw frame.
@@ -107,12 +114,23 @@ impl<R: Radio> RcpDevice<R> {
     /// messages that are not a response to a specific request.
     pub fn poll_raw_rx(&mut self, buf: &mut [u8]) -> Option<Frame> {
         let n = self.radio.try_receive(buf)?;
+
+        // Everything but `channel` stays at its `spinel.h` default: `Radio::try_receive`
+        // only exposes the received bytes today, not per-frame radio metadata. `channel` is
+        // real, read from the radio itself.
+        let rx_frame = RawRxFrame {
+            channel: Some(self.radio.channel()),
+            ..RawRxFrame::new(Bytes::copy_from_slice(&buf[..n]))
+        };
+
+        // A received frame never exceeds `buf`, which the caller sizes for an
+        // 802.15.4 frame, so an oversized PSDU is a caller bug and is dropped.
+        let mut value = BytesMut::new();
+        rx_frame.encode(&mut value).ok()?;
+
         Some(Frame::new(
             Header::new(self.iid, 0),
-            Command::PropertyValueIs(
-                Property::Stream(PropertyStream::Raw),
-                Bytes::copy_from_slice(&buf[..n]),
-            ),
+            Command::PropertyValueIs(Property::Stream(PropertyStream::Raw), value.freeze()),
         ))
     }
 
@@ -149,7 +167,13 @@ impl<R: Radio> RcpDevice<R> {
             Property::MacPromiscuousMode => {
                 decode_bool(&value).and_then(|v| self.radio.set_promiscuous(v))
             }
-            Property::Stream(PropertyStream::Raw) => self.radio.transmit(&value),
+            // The optional transmit parameters (channel override, CSMA, retries, tx
+            // power, ...) are accepted -- so a real caller sending them doesn't get a
+            // parse error -- but not yet acted on: `Radio::transmit` has no per-call
+            // parameter surface today.
+            Property::Stream(PropertyStream::Raw) => RawTxFrame::decode(&value)
+                .map_err(|_| Status::ParseError)
+                .and_then(|tx| self.radio.transmit(&tx.psdu)),
             _ => Err(Status::PropertyNotFound),
         };
 
@@ -216,6 +240,16 @@ fn encode_i8(value: i8) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decode the raw rx frame an unsolicited `STREAM_RAW` frame carries.
+    pub(crate) fn raw_rx_frame(frame: &Frame) -> Option<RawRxFrame> {
+        match frame.command() {
+            Command::PropertyValueIs(Property::Stream(PropertyStream::Raw), value) => {
+                RawRxFrame::decode(&value).ok()
+            }
+            _ => None,
+        }
+    }
 
     #[derive(Default)]
     struct MockRadio {
@@ -337,15 +371,34 @@ mod tests {
     #[test]
     fn raw_stream_set_transmits_and_confirms_via_status() {
         let mut device = RcpDevice::new(MockRadio::default(), 0);
-        let payload = Bytes::from_static(&[0x01, 0x02, 0x03]);
+        let psdu = Bytes::from_static(&[0x01, 0x02, 0x03]);
+        let tx_frame = RawTxFrame {
+            psdu: psdu.clone(),
+            channel: 11,
+            config: crate::RawTxConfig::default(),
+        };
+        let mut value = BytesMut::new();
+        tx_frame.encode(&mut value).unwrap();
 
         let reply = device.handle_frame(request(Command::PropertyValueSet(
             Property::Stream(PropertyStream::Raw),
-            payload.clone(),
+            value.freeze(),
         )));
 
         assert_eq!(reply.last_status(), Some(Status::Ok));
-        assert_eq!(device.radio().transmitted, Some(payload));
+        assert_eq!(device.radio().transmitted, Some(psdu));
+    }
+
+    #[test]
+    fn raw_stream_set_reports_parse_error_on_malformed_frame() {
+        let mut device = RcpDevice::new(MockRadio::default(), 0);
+
+        let reply = device.handle_frame(request(Command::PropertyValueSet(
+            Property::Stream(PropertyStream::Raw),
+            Bytes::from_static(&[0xFF]),
+        )));
+
+        assert_eq!(reply.last_status(), Some(Status::ParseError));
     }
 
     #[test]
@@ -358,13 +411,10 @@ mod tests {
 
         assert_eq!(frame.header().iid(), 3);
         assert_eq!(frame.header().tid(), 0);
-        assert_eq!(
-            frame.command(),
-            Command::PropertyValueIs(
-                Property::Stream(PropertyStream::Raw),
-                Bytes::from_static(&[0xAB, 0xCD])
-            )
-        );
+
+        let rx_frame = raw_rx_frame(&frame).expect("raw rx frame");
+        assert_eq!(rx_frame.psdu, Bytes::from_static(&[0xAB, 0xCD]));
+        assert_eq!(rx_frame.channel, Some(device.radio().channel()));
 
         assert!(device.poll_raw_rx(&mut buf).is_none());
     }
