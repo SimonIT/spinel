@@ -609,7 +609,7 @@ struct PosixSpinelHost<T> {
     /// HDLC encoded stream of messages coming from a byte transport
     stream: Framed<T, HdlcCodec>,
 
-    /// Instance ID
+    /// Interface ID
     iid: u8,
 
     /// Cursor for the next transaction ID to try

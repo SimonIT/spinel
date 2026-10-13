@@ -4,6 +4,11 @@ use crate::codec::vendor::{NoVendor, Vendor};
 use crate::codec::PackedU32;
 use crate::{Command, Error, Property, Status};
 
+/// The header byte of a Spinel frame: a fixed flag, the Interface Identifier (IID) and the
+/// Transaction Identifier (TID).
+///
+/// A reply uses the same IID and TID as the command it answers. TID 0 marks frames that don't
+/// expect a correlated reply, such as unsolicited updates from the device.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Header {
@@ -20,7 +25,7 @@ impl Header {
     const HEADER_IID_SHIFT: u32 = 4;
     const HEADER_TID_MASK: u8 = 0b0000_1111;
 
-    /// Create a new [`Header`] with the a Instance Identifier (IID) and Transaction Identifier (TID).
+    /// Create a new [`Header`] with the given Interface Identifier (IID) and Transaction Identifier (TID).
     pub fn new(iid: u8, tid: u8) -> Self {
         Self {
             flag: Self::HEADER_FLAG,
@@ -29,7 +34,7 @@ impl Header {
         }
     }
 
-    /// Get the Instance Identifier (IID) from the header.
+    /// Get the Interface Identifier (IID) from the header.
     pub fn iid(&self) -> u8 {
         self.iid
     }
