@@ -269,7 +269,7 @@ mod tests {
 
         // Generate a some what random vector and make sure it does not contain
         // the frame delimiter
-        let mut test_vector: Vec<u8> = (0..512)
+        let mut test_vector: BytesMut = (0..512)
             .map(|_| rng.sample(range))
             .map(|b| if b == 0x7E { b + 1 } else { b })
             .collect();
@@ -279,7 +279,7 @@ mod tests {
         test_vector[random_index] = 0x7E;
 
         // Check that the frame delimiter is in the expected position
-        let bytes = Bytes::from(test_vector);
+        let bytes = test_vector.freeze();
         let index = HdlcLiteFrame::<NoVendor>::find_frame_delimiter(&bytes);
         assert_eq!(index, Some(random_index));
     }
@@ -305,7 +305,7 @@ mod tests {
     fn resync_drops_through_next_delimiter_once_oversized() {
         let mut buffer = BytesMut::new();
         buffer.put_u8(0x7E);
-        buffer.extend(std::iter::repeat_n(
+        buffer.extend(core::iter::repeat_n(
             0xAAu8,
             HdlcLiteFrame::<NoVendor>::MAX_BUFFER_SIZE,
         ));
@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn resync_clears_buffer_with_no_delimiter() {
-        let mut buffer = BytesMut::from_iter(std::iter::repeat_n(
+        let mut buffer = BytesMut::from_iter(core::iter::repeat_n(
             0xAAu8,
             HdlcLiteFrame::<NoVendor>::MAX_BUFFER_SIZE + 1,
         ));
@@ -416,7 +416,6 @@ mod tests {
         let hdlc_frame = HdlcLiteFrame::new(frame);
         let mut buffer = BytesMut::with_capacity(4096);
         hdlc_frame.encode(&mut buffer).unwrap();
-        println!("{buffer:02x?}");
         // assert_eq!(encoded, Ok(HdlcEncodedBytes::new([0x7e, 0x01, 0x02, 0x7e])))
         assert_eq!(buffer, Bytes::from_static(&TEST_REQ_NCP_VERSION_ARRAY));
     }
@@ -562,7 +561,6 @@ mod tests {
     #[test]
     fn decode_stream() {
         let bytes = Bytes::from_static(&TEST_HDLC_DECODE_STREAM);
-        println!("bytes: {:02x?}", &bytes[..]);
         let frame = HdlcLiteFrame::<NoVendor>::decode(&bytes);
         assert!(frame.is_ok());
         // todo: assert frame is stream
