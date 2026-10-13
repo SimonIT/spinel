@@ -858,6 +858,7 @@ where
     ) -> Option<u8> {
         log::trace!("Sending request: {cmd:?}");
 
+        self.prune_abandoned_requests();
         let Some(tid) = self.next_free_tid() else {
             log::warn!("No free TID for request: {cmd:?}");
             let _ = reply.send(Err(Error::RequestBusy));
@@ -926,6 +927,22 @@ where
         } else {
             tid + 1
         }
+    }
+
+    /// Drop pending requests whose caller has stopped waiting for the response.
+    ///
+    /// Requests are otherwise only removed when a response arrives or their
+    /// deadline passes, so a caller that drops its request, such as one
+    /// cancelled by an outer timeout, would hold its TID until then.
+    fn prune_abandoned_requests(&mut self) {
+        let tx_radio_tid = &mut self.tx_radio_tid;
+        self.lut.retain(|tid, pending| {
+            let abandoned = pending.sender.is_closed();
+            if abandoned && *tx_radio_tid == Some(*tid) {
+                *tx_radio_tid = None;
+            }
+            !abandoned
+        });
     }
 
     /// Resolve every request whose deadline is past with a timeout error.
@@ -1096,6 +1113,26 @@ mod tests {
         for task in pending {
             assert_eq!(task.await.unwrap(), Err(Error::RequestTimeout));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abandoned_requests_free_their_tid() {
+        let (handle, _device) = setup();
+
+        // Fill all fifteen TIDs, then abandon every request.
+        let mut pending = Vec::new();
+        for _ in 0..15 {
+            let h = handle.clone();
+            pending.push(tokio::spawn(async move { h.noop().await }));
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        for task in &pending {
+            task.abort();
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        // The new request gets a TID and runs to its own timeout.
+        assert_eq!(handle.noop().await, Err(Error::RequestTimeout));
     }
 
     #[tokio::test(start_paused = true)]
