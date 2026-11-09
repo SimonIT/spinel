@@ -1,5 +1,8 @@
 use crate::codec::NoVendor;
-use crate::{Command, Error, Frame, HdlcLiteFrame, Header, Property};
+use crate::{
+    Command, Error, Frame, HdlcLiteFrame, Header, Property, PropertyStream, RawRxFrame, RawTxDone,
+    RawTxFrame, Status,
+};
 use bytes::BytesMut;
 use embedded_io_async::{Read, Write};
 
@@ -136,6 +139,60 @@ where
         match response.command() {
             Command::PropertyValueIs(Property::NcpVersion, value) => Ok(value),
             _ => Err(Error::UnexpectedResponse(cmd_id)),
+        }
+    }
+
+    /// Transmit a raw 802.15.4 frame through the radio.
+    ///
+    /// Resolves with the device's transmit-done report. A radio outcome such as
+    /// [`Status::NoAck`] or [`Status::CcaFailure`] is returned in the report; any
+    /// other non-OK status means the device rejected the request and resolves as
+    /// [`Error::Status`].
+    pub async fn transmit_raw(&mut self, frame: &RawTxFrame) -> Result<RawTxDone, Error> {
+        let mut payload = BytesMut::new();
+        frame.encode(&mut payload)?;
+
+        let response = self
+            .request(Command::PropertyValueSet(
+                Property::Stream(PropertyStream::Raw),
+                payload.freeze(),
+            ))
+            .await?;
+
+        let cmd_id = response.command().id();
+        let done = match response.command() {
+            Command::PropertyValueIs(Property::LastStatus, v)
+            | Command::PropertyValueIs(Property::Stream(PropertyStream::Raw), v) => {
+                RawTxDone::decode(&v)?
+            }
+            _ => return Err(Error::UnexpectedResponse(cmd_id)),
+        };
+
+        match done.status {
+            Status::Ok | Status::NoAck | Status::CcaFailure => Ok(done),
+            status => Err(Error::Status(u32::from(status))),
+        }
+    }
+
+    /// Wait for the next unsolicited raw 802.15.4 frame from the radio.
+    ///
+    /// Like [`request`](Self::request), any frame received in the meantime that doesn't
+    /// match what's being waited for (a solicited response to some other in-flight
+    /// request, an unsolicited reset, or a `STREAM_DEBUG`/`STREAM_NET`/`STREAM_LOG`
+    /// broadcast, or a malformed raw-stream payload) is dropped -- see the type-level docs.
+    pub async fn receive_raw(&mut self) -> Result<RawRxFrame, Error> {
+        loop {
+            let frame = self.recv_frame().await?;
+            if frame.header().tid() != 0 {
+                continue;
+            }
+            if let Command::PropertyValueIs(Property::Stream(PropertyStream::Raw), value) =
+                frame.command()
+            {
+                if let Ok(rx_frame) = RawRxFrame::decode(&value) {
+                    return Ok(rx_frame);
+                }
+            }
         }
     }
 }
